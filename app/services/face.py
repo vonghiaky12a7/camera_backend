@@ -3,7 +3,7 @@
 # AI Inference Engine – Face Detection & Embedding Extraction
 #
 # Responsibilities:
-#   1. Initialize InsightFace (buffalo_s) with strict CPU / ONNX thread limits.
+#   1. Initialize InsightFace (buffalo_l) with strict CPU / ONNX thread limits.
 #   2. Expose a process-level singleton (FaceAnalyzer) that is created ONCE
 #      per Celery worker process via the worker_process_init signal in
 #      app/tasks/celery_app.py and reused across all subsequent tasks.
@@ -12,7 +12,6 @@
 #        FaceAnalyzer.get()                       – returns the live instance
 #        FaceAnalyzer.teardown()                  – called by worker shutdown hook
 #        analyzer.extract(image) -> list[Face]    – run detection + embedding
-#        analyzer.primary_face(image) -> Face|None– largest / highest-conf face
 #
 # CPU discipline (per spec §4):
 #   - CPUExecutionProvider only; GPU provider is never registered.
@@ -21,7 +20,7 @@
 #   - Thread env vars are set at the top of this module as a last-resort guard
 #     (the canonical enforcement is in docker-compose.yml environment: section).
 #
-# InsightFace buffalo_s model internals:
+# InsightFace buffalo_l model internals:
 #   - det_10g.onnx      – RetinaFace detector (MobileNet backbone)
 #   - w600k_mbf.onnx    – MobileFaceNet recognizer → 512-dim L2-normalised vector
 #   Both ONNX sessions are created with the same restricted SessionOptions.
@@ -70,8 +69,7 @@ class FaceResult:
     """
     Structured output for a single detected face.
 
-    Returned by :meth:`FaceAnalyzer.extract` and
-    :meth:`FaceAnalyzer.primary_face`.
+    Returned by :meth:`FaceAnalyzer.extract`.
 
     Attributes:
         embedding:    512-dim L2-normalised numpy array from MobileFaceNet.
@@ -80,7 +78,7 @@ class FaceResult:
         landmark:     5-point facial landmark array, shape (5, 2). May be None
                       if the model did not produce landmarks.
         embedding_norm: L2 norm of the raw embedding (should be ≈ 1.0 for
-                      buffalo_s; useful for sanity checking).
+                      buffalo_l; useful for sanity checking).
     """
 
     embedding: np.ndarray  # shape (512,)
@@ -123,7 +121,7 @@ def _build_session_options() -> ort.SessionOptions:
                                                   total thread count.
         inter_op_num_threads = ORT_INTER (1)    – threads used to run independent
                                                   graph nodes in parallel. Set to 1
-                                                  because buffalo_s graphs are
+                                                  because buffalo_l graphs are
                                                   largely sequential.
         graph_optimization_level = ORT_ENABLE_ALL – fold constants, fuse ops.
                                                   Safe for CPU; improves latency
@@ -239,27 +237,29 @@ def _patch_insightface_ort_session(sess_opts: ort.SessionOptions) -> None:
 
 class FaceAnalyzer:
     """
-    Process-level singleton wrapping InsightFace's FaceAnalysis pipeline.
+        Process-level singleton wrapping InsightFace's FaceAnalysis pipeline.
 
-    Lifecycle (managed by Celery worker signals in app/tasks/celery_app.py):
+        Lifecycle (managed by Celery worker signals in app/tasks/celery_app.py):
 
-        worker_process_init    → FaceAnalyzer.initialize()
-        task execution         → FaceAnalyzer.get().extract(image)
-        worker_process_shutdown→ FaceAnalyzer.teardown()
+            worker_process_init    → FaceAnalyzer.initialize()
+            task execution         → FaceAnalyzer.get().extract(image)
+            worker_process_shutdown→ FaceAnalyzer.teardown()
 
-    Thread safety:
-        Each Celery prefork worker process has exactly ONE FaceAnalyzer
-        instance. Multiple concurrent Celery tasks do NOT share the same
-        process, so no locking is required.
+        Thread safety:
+            Each Celery prefork worker process has exactly ONE FaceAnalyzer
+            instance. Multiple concurrent Celery tasks do NOT share the same
+            process, so no locking is required.
 
-    Usage (inside a Celery task)::
+        Usage (inside a Celery task)::
 
-        from app.services.face import FaceAnalyzer
+            from app.services.face import FaceAnalyzer
 
-        analyzer = FaceAnalyzer.get()
-        face = analyzer.primary_face(image_array)
-        if face:
-            embedding = face.to_list()   # → list[float] ready for pgvector
+            analyzer = FaceAnalyzer.get()
+
+    faces = analyzer.extract(image_array)
+
+    for face in faces:
+        embedding = face.to_list()
     """
 
     _instance: Optional["FaceAnalyzer"] = None
@@ -275,7 +275,7 @@ class FaceAnalyzer:
     @classmethod
     def initialize(cls) -> None:
         """
-        Load and warm up the buffalo_s model.
+        Load and warm up the buffalo_l model.
 
         Steps:
           1. Apply ONNX SessionOptions monkey-patch.
@@ -417,33 +417,6 @@ class FaceAnalyzer:
         results.sort(key=lambda f: f.det_score, reverse=True)
         return results
 
-    def primary_face(self, image: np.ndarray) -> Optional[FaceResult]:
-        """
-        Return the single most prominent face in ``image``, or ``None``.
-
-        "Most prominent" is defined as the largest bounding-box area among
-        faces whose detection score meets the configured threshold. This
-        heuristic correctly selects the employee facing the camera directly
-        when a crowd is visible in the background.
-
-        Args:
-            image: BGR uint8 numpy array.
-
-        Returns:
-            The best :class:`FaceResult`, or ``None`` if no face meets the
-            detection threshold.
-        """
-        faces = self.extract(image)
-
-        # Filter to faces that meet the detection confidence threshold
-        qualified = [f for f in faces if f.det_score >= settings.insightface_det_thresh]
-
-        if not qualified:
-            return None
-
-        # Among qualified faces, pick the largest (closest to camera)
-        return max(qualified, key=lambda f: f.bbox_area)
-
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
@@ -461,7 +434,7 @@ class FaceAnalyzer:
 
             {
                 "status": "ok",
-                "model": "buffalo_s",
+                "model": "buffalo_l",
                 "call_count": 1042,
                 "det_thresh": 0.5,
                 "ort_intra_threads": 2,

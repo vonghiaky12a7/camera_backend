@@ -73,8 +73,8 @@ app.add_middleware(
 # Phục vụ thư mục chứa ảnh snapshot tạm thời để UI Next.js có thể hiển thị
 import os
 
-os.makedirs(settings.snapshot_dir, exist_ok=True)
-app.mount("/snapshots", StaticFiles(directory=settings.snapshot_dir), name="snapshots")
+os.makedirs(settings.raw_snapshot_dir, exist_ok=True)
+app.mount("/snapshots", StaticFiles(directory=settings.raw_snapshot_dir), name="snapshots")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(cameras.router, tags=["Cameras"])

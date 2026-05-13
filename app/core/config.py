@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     celery_task_time_limit: int = 30
 
     # ── InsightFace / ONNX ────────────────────────────────────────────────────
-    insightface_model_name: str = "buffalo_s"
+    insightface_model_name: str = "buffalo_l"
     insightface_model_dir: str = "/app/models_cache"
     insightface_det_thresh: float = 0.5
     insightface_rec_thresh: float = 0.45
@@ -63,12 +63,13 @@ class Settings(BaseSettings):
     ort_inter_op_num_threads: int = 1
 
     # ── Vector search ─────────────────────────────────────────────────────────
-    vector_distance_op: Literal["l2", "inner_product"] = "l2"
-    vector_match_threshold: float = 0.9
+    vector_distance_op: Literal["l2", "inner_product", "cosine"] = "cosine"
+    vector_match_threshold: float = 0.6
     vector_top_k: int = 3
 
     # ── Snapshot storage ──────────────────────────────────────────────────────
-    snapshot_dir: str = "/tmp/snapshots"
+    raw_snapshot_dir: str = "/tmp/snapshots"
+    processed_snapshot_dir: str = "/app/snapshots"
     snapshot_ttl_seconds: int = 300
 
     # ── Camera / Hikvision ────────────────────────────────────────────────────

@@ -115,15 +115,15 @@ class CameraEventLog(Base):
         nullable=True,
         comment="Denormalized partner name at the time of the event",
     )
-    distance_score: Mapped[Optional[float]] = mapped_column(
+    similarity_score: Mapped[Optional[float]] = mapped_column(
         Float,
         nullable=True,
-        comment="pgvector L2 distance; lower = more similar (0.0 = identical)",
+        comment="pgvector cosine similarity; higher = more similar (1.0 = identical)",
     )
     confidence: Mapped[Optional[float]] = mapped_column(
         Float,
         nullable=True,
-        comment="Normalised confidence 0.0-1.0 derived from distance_score",
+        comment="Normalised confidence 0.0-1.0 derived from similarity_score",
     )
 
     # ── Snapshot reference ────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ class CameraEventLog(Base):
         camera_id: str,
         partner_id: int,
         partner_name: str,
-        distance: float,
+        similarity: float,
         confidence: float,
         snapshot_filename: str | None,
         snapshot_url: str | None,
@@ -203,7 +203,7 @@ class CameraEventLog(Base):
             processing_status=ProcessingStatus.SUCCESS,
             matched_partner_id=partner_id,
             matched_partner_name=partner_name,
-            distance_score=distance,
+            similarity_score=similarity,
             confidence=confidence,
             snapshot_filename=snapshot_filename,
             snapshot_url=snapshot_url,

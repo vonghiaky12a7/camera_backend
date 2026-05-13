@@ -17,6 +17,7 @@ import os
 import time
 import json
 from datetime import datetime
+import cv2
 
 import httpx
 from celery import shared_task
@@ -48,6 +49,104 @@ def run_async(coro):
         asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
 
+
+def save_processed_snapshot(
+    image,
+    faces,
+    camera_id: str,
+    snapshot_filename: str,
+) -> None:
+    """
+    Save:
+      1. Annotated full image
+      2. Cropped face images
+    """
+
+    try:
+        base_dir = settings.processed_snapshot_dir
+
+        processed_dir = os.path.join(
+            base_dir,
+            "processed",
+        )
+
+        faces_dir = os.path.join(
+            base_dir,
+            "faces",
+        )
+
+        os.makedirs(processed_dir, exist_ok=True)
+        os.makedirs(faces_dir, exist_ok=True)
+
+        # ============================================================
+        # Annotated image
+        # ============================================================
+
+        processed_filename = snapshot_filename.rsplit(".", 1)[0] + "_processed.jpg"
+
+        processed_path = os.path.join(
+            processed_dir,
+            processed_filename,
+        )
+
+        processed_image = image.copy()
+
+        for idx, face in enumerate(faces):
+            x1, y1, x2, y2 = map(int, face.bbox)
+
+            cv2.rectangle(
+                processed_image,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                processed_image,
+                f"Face {idx+1} {face.det_score:.2f}",
+                (x1, max(20, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+            # ========================================================
+            # Cropped face
+            # ========================================================
+
+            face_crop = image[y1:y2, x1:x2]
+
+            if face_crop.size > 0:
+                face_filename = (
+                    snapshot_filename.rsplit(".", 1)[0] + f"_face_{idx+1}.jpg"
+                )
+
+                face_path = os.path.join(
+                    faces_dir,
+                    face_filename,
+                )
+
+                cv2.imwrite(
+                    face_path,
+                    face_crop,
+                )
+
+        cv2.imwrite(
+            processed_path,
+            processed_image,
+        )
+
+        logger.info(
+            f"[{camera_id}] Saved processed snapshot + " f"{len(faces)} face crops"
+        )
+
+    except Exception as exc:
+        logger.error(
+            f"[{camera_id}] Failed saving processed snapshot: {exc}",
+            exc_info=True,
+        )
 
 # ---------------------------------------------------------------------------
 # Main Celery task
@@ -86,7 +185,10 @@ def process_camera_event(
         t_detect = time.perf_counter()
         analyzer = FaceAnalyzer.get()
         image = load_image_from_path(
-            os.path.join(settings.snapshot_dir, snapshot_filename)
+            os.path.join(
+                settings.raw_snapshot_dir,
+                snapshot_filename,
+            )
         )
 
         faces = analyzer.extract(image)
@@ -95,6 +197,14 @@ def process_camera_event(
         valid_faces = [
             f for f in faces if f.det_score >= settings.insightface_det_thresh
         ]
+
+        # Save processed snapshot with AI annotations
+        save_processed_snapshot(
+            image=image,
+            faces=valid_faces,
+            camera_id=camera_id,
+            snapshot_filename=snapshot_filename,
+        )
 
         if not valid_faces:
             logger.info(
@@ -135,9 +245,16 @@ def process_camera_event(
 
         # Tạo file JSON cùng tên với file ảnh (đổi đuôi .jpg thành .json)
         json_filename = snapshot_filename.rsplit(".", 1)[0] + ".json"
-        json_filepath = os.path.join(settings.snapshot_dir, json_filename)
+        json_filepath = os.path.join(
+            settings.processed_snapshot_dir,
+            "json",
+            json_filename,
+        )
 
         try:
+            # THÊM DÒNG NÀY ĐỂ TRÁNH LỖI "No such file or directory"
+            os.makedirs(os.path.dirname(json_filepath), exist_ok=True)
+
             with open(json_filepath, "w", encoding="utf-8") as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
             logger.info(
@@ -159,11 +276,11 @@ def process_camera_event(
             event_payload["bbox"] = face.bbox.tolist()
 
             if match_result:
-                partner, distance = match_result
-                confidence = max(0.0, 1.0 - distance)
+                partner, similarity = match_result
+                confidence = similarity
 
                 logger.info(
-                    f"[{camera_id}] ✅ MẶT #{idx+1}: {partner.name} (Conf: {confidence:.2%}, Dist: {distance:.3f}) - Search: {search_time:.1f}ms"
+                    f"[{camera_id}] ✅ MẶT #{idx+1}: {partner.name} (Conf: {confidence:.2%}, Sim: {similarity:.3f}) - Search: {search_time:.1f}ms"
                 )
 
                 event_payload.update(
@@ -172,7 +289,7 @@ def process_camera_event(
                         "partner_id": partner.id,
                         "partner_name": partner.name,
                         "confidence": round(confidence, 4),
-                        "distance_score": distance,
+                        "similarity_score": similarity,
                     }
                 )
 
@@ -180,7 +297,7 @@ def process_camera_event(
                     _handle_match(
                         camera_id=camera_id,
                         partner=partner,
-                        distance=distance,
+                        similarity=similarity,
                         confidence=confidence,
                         snapshot_filename=snapshot_filename,
                         snapshot_url=snapshot_url,
@@ -278,7 +395,7 @@ async def _handle_unknown(
 async def _handle_match(
     camera_id: str,
     partner,
-    distance: float,
+    similarity: float,
     confidence: float,
     snapshot_filename: str,
     snapshot_url: str,
@@ -298,7 +415,7 @@ async def _handle_match(
                 camera_id=camera_id,
                 partner_id=partner.id,
                 partner_name=partner.name,
-                distance=distance,
+                similarity=similarity,
                 confidence=confidence,
                 snapshot_filename=snapshot_filename,
                 snapshot_url=snapshot_url,
@@ -342,19 +459,39 @@ async def _finish_event(event_payload: dict) -> None:
 
 
 async def _vector_search_odoo(embedding: list[float]):
-    """Search the face_embedding table for the closest vector match."""
+    """
+    Cosine similarity search.
+    Higher score = more similar.
+    """
+
     async with get_db_session() as db:
-        distance_expr = FaceEmbedding.embedding.l2_distance(embedding)
+
+        # pgvector cosine similarity:
+        # 0.0 = identical
+        # 1.0 = opposite
+        # cosine_distance: 0.0 là giống hệt, 2.0 là đối lập
+        distance_expr = FaceEmbedding.embedding.cosine_distance(embedding)
+
+        # Chuyển đổi distance thành similarity: 1.0 - distance
+        # Kết quả similarity sẽ nằm trong khoảng: 1.0 (hoàn hảo) đến -1.0 (đối lập)
+        similarity_expr = (1.0 - distance_expr).label("similarity")
 
         stmt = (
-            select(ResPartner, distance_expr.label("distance"))
+            select(
+                ResPartner,
+                similarity_expr,
+            )
             .select_from(FaceEmbedding)
-            .join(ResPartner, FaceEmbedding.partner_id == ResPartner.id)
+            .join(
+                ResPartner,
+                FaceEmbedding.partner_id == ResPartner.id,
+            )
             .where(FaceEmbedding.active == True)
             .where(ResPartner.active == True)
             .where(FaceEmbedding.embedding != None)
-            .where(distance_expr <= settings.vector_match_threshold)
-            .order_by(distance_expr)
+            # Threshold giờ sẽ so sánh chuẩn với similarity
+            .where(similarity_expr >= settings.vector_match_threshold)
+            .order_by(similarity_expr.desc())
             .limit(1)
         )
 

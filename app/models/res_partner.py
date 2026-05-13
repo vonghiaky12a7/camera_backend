@@ -11,12 +11,11 @@
 #     matching the `vector(512)` column added to Odoo's res_partner table.
 #
 # pgvector operator reference:
-#   <->   L2 (Euclidean) distance       – use for cosine-normalised embeddings
-#   <#>   negative inner product        – use when embeddings are L2-normalised
-#   <=>   cosine distance               – 1 - cosine_similarity
+#   <->   L2 (Euclidean) distance
+#   <#>   negative inner product
+#   <=>   cosine distance (1 - cosine_similarity)
 #
-# InsightFace buffalo_s produces L2-normalised embeddings, so both <-> and <#>
-# give equivalent ranking. We default to <-> (L2) as it is more intuitive.
+# InsightFace buffalo_l produces L2-normalised embeddings, so both <-> and <#>
 # =============================================================================
 
 from __future__ import annotations
@@ -66,7 +65,7 @@ class ResPartner(Base):
     face_embedding: Mapped[Optional[list[float]]] = mapped_column(
         Vector(512),
         nullable=True,
-        comment="512-dim face embedding produced by InsightFace buffalo_s",
+        comment="512-dim face embedding produced by InsightFace buffalo_l",
     )
 
     # ── Audit timestamps (Odoo standard) ──────────────────────────────────────

@@ -324,7 +324,7 @@ async def receive_camera_event(
         image_size_kb = len(image_data) / 1024
 
         filename = f"{camera_id}_{event_type}_{uuid.uuid4().hex[:8]}.jpg"
-        filepath = os.path.join(settings.snapshot_dir, filename)
+        filepath = os.path.join(settings.raw_snapshot_dir, filename)
         with open(filepath, "wb") as f:
             f.write(image_data)
 
