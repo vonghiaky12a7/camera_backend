@@ -1,10 +1,17 @@
 # backend/app/api/cameras.py
+# =============================================================================
+# Changes in this version:
+#   - Tối ưu Async File I/O bằng aiofiles chống khóa Event Loop
+#   - get_recognition_logs: DISTINCT ON partner to show only latest image per user
+# =============================================================================
+
 import logging
 import os
 import uuid
 import re
+import aiofiles
 from datetime import datetime, timezone
-
+import asyncio
 from fastapi import (
     APIRouter,
     HTTPException,
@@ -14,13 +21,12 @@ from fastapi import (
     Body,
     Path,
 )
-from starlette.status import HTTP_200_OK, HTTP_401_UNAUTHORIZED
+from starlette.status import HTTP_200_OK, HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 
 from app.core.config import settings
 from app.core.redis import EventSubscriber
 from app.core.database import get_db_session
 from app.tasks.process_event import process_camera_event
-from app.services.stats_service import update_dashboard_stats
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
@@ -28,22 +34,17 @@ router = APIRouter()
 
 
 # =============================================================================
-# DASHBOARD REST ENDPOINTS  (dùng cho Next.js frontend)
+# DASHBOARD REST ENDPOINTS
 # =============================================================================
 
 
 @router.get("/api/v1/dashboard/stats")
 async def get_dashboard_stats():
     """
-    Trả về 4 chỉ số tổng hợp toàn hệ thống:
-      - total_cameras
-      - online_cameras
-      - total_customers  (face_match hôm nay)
-      - total_waiting    (unknown_face hôm nay)
-
-    Next.js gọi endpoint này mỗi lần load trang.
-    Dữ liệu đã được backend AI cập nhật thẳng vào camera_floor,
-    nên query ở đây chỉ là SUM đơn giản, rất nhanh.
+    4 system-wide counters:
+      - total_cameras / online_cameras
+      - total_customers (matched faces today, per res_partner tracking fields)
+      - total_waiting   (unmatched faces in last 30 min rolling window)
     """
     sql = text("""
         SELECT
@@ -66,10 +67,7 @@ async def get_dashboard_stats():
 
 @router.get("/api/v1/dashboard/floors")
 async def get_floors():
-    """
-    Trả về danh sách tất cả floors kèm cameras.
-    Next.js dùng để render FloorTabs + CameraGrid.
-    """
+    """All floors with their cameras for FloorTabs + CameraGrid."""
     floor_sql = text("""
         SELECT
             f.id,
@@ -103,13 +101,10 @@ async def get_floors():
         floor_rows = (await db.execute(floor_sql)).mappings().all()
         camera_rows = (await db.execute(camera_sql)).mappings().all()
 
-    # Group cameras by floor_id
     cameras_by_floor: dict[int, list] = {}
     for cam in camera_rows:
         fid = cam["floor_id"]
-        if fid not in cameras_by_floor:
-            cameras_by_floor[fid] = []
-        cameras_by_floor[fid].append(
+        cameras_by_floor.setdefault(fid, []).append(
             {
                 "id": str(cam["id"]),
                 "name": cam["name"],
@@ -143,26 +138,44 @@ async def get_floors():
 @router.get("/api/v1/dashboard/recognition-logs")
 async def get_recognition_logs(limit: int = 20):
     """
-    Trả về danh sách nhận diện khuôn mặt gần nhất.
-    Dùng cho sidebar RecognitionLogsSidebar và bảng RecognitionTable.
+    Latest recognition events for the sidebar and history table.
     """
     sql = text("""
         SELECT
-            r.id,
-            r.confidence,
-            r.is_matched,
-            r.scanned_at,
-            p.id        AS partner_id,
-            p.name      AS partner_name,
-            p.phone     AS partner_phone,
-            c.id        AS camera_id,
-            c.name      AS camera_name,
-            z.name      AS zone_name
-        FROM camera_scan_history_result r
-        LEFT JOIN res_partner p  ON p.id  = r.partner_id
-        LEFT JOIN camera_camera c ON c.id = r.camera_id
-        LEFT JOIN camera_zone   z ON z.id = c.zone_id
-        ORDER BY r.scanned_at DESC
+            id,
+            confidence,
+            is_matched,
+            scanned_at,
+            partner_id,
+            partner_name,
+            partner_phone,
+            camera_id,
+            camera_name,
+            zone_name
+        FROM (
+            SELECT DISTINCT ON (
+                COALESCE(r.partner_id::text, r.id::text)
+            )
+                r.id,
+                r.confidence,
+                r.is_matched,
+                r.scanned_at,
+                p.id        AS partner_id,
+                p.name      AS partner_name,
+                p.phone     AS partner_phone,
+                c.id        AS camera_id,
+                c.name      AS camera_name,
+                z.name      AS zone_name
+            FROM camera_scan_history_result r
+            LEFT JOIN res_partner   p ON p.id  = r.partner_id
+            LEFT JOIN camera_camera c ON c.id  = r.camera_id
+            LEFT JOIN camera_zone   z ON z.id  = c.zone_id
+            WHERE r.is_hidden = FALSE
+            ORDER BY
+                COALESCE(r.partner_id::text, r.id::text),  
+                r.scanned_at DESC                           
+        ) sub
+        ORDER BY scanned_at DESC
         LIMIT :limit
     """)
 
@@ -172,7 +185,7 @@ async def get_recognition_logs(limit: int = 20):
     results = []
     for r in rows:
         scanned_at_str = str(r["scanned_at"]) if r["scanned_at"] else ""
-        # Format timestamp thành "X min ago"
+
         try:
             utc_dt = datetime.fromisoformat(
                 scanned_at_str.replace(" ", "T").rstrip("Z")
@@ -187,7 +200,6 @@ async def get_recognition_logs(limit: int = 20):
         except Exception:
             timestamp_rel = scanned_at_str
 
-        # Status logic: matched=verified, confidence>0=pending, else=flagged
         confidence_pct = float(r["confidence"] or 0)
         is_matched = bool(r["is_matched"])
         if is_matched:
@@ -197,12 +209,13 @@ async def get_recognition_logs(limit: int = 20):
         else:
             status = "flagged"
 
-        location_parts = [r["camera_name"], r["zone_name"]]
-        location = " — ".join(p for p in location_parts if p) or "Unknown location"
+        location = (
+            " — ".join(p for p in [r["camera_name"], r["zone_name"]] if p)
+            or "Unknown location"
+        )
 
         results.append(
             {
-                # Dùng chung cho cả sidebar log lẫn bảng history
                 "id": str(r["id"]),
                 "customerId": str(r["partner_id"]) if r["partner_id"] else "",
                 "customerName": r["partner_name"] or "Unknown visitor",
@@ -210,14 +223,15 @@ async def get_recognition_logs(limit: int = 20):
                 "gender": "—",
                 "timestamp": timestamp_rel,
                 "scannedAt": scanned_at_str,
-                # Bảng history
-                "confidence": round(confidence_pct / 100, 4),  # 0-1
+                "confidence": round(confidence_pct / 100, 4),
                 "status": status,
                 "location": location,
                 "isMatched": is_matched,
                 "cameraName": r["camera_name"] or "Unknown camera",
-                # URL ảnh khuôn mặt (qua Odoo image route)
-                "faceImageUrl": f"{settings.odoo_base_url}/web/image?model=camera.scan.history.result&id={r['id']}&field=face_image",
+                "faceImageUrl": (
+                    f"{settings.odoo_base_url}/web/image"
+                    f"?model=camera.scan.history.result&id={r['id']}&field=face_image"
+                ),
             }
         )
 
@@ -226,10 +240,7 @@ async def get_recognition_logs(limit: int = 20):
 
 @router.get("/api/v1/dashboard/analytics")
 async def get_analytics():
-    """
-    Thống kê số lượt scan theo khung giờ trong ngày hôm nay.
-    Dùng cho AnalyticsChart (visits = tổng scan, conversions = matched).
-    """
+    """Hourly scan counts for today (grouped into 3-hour slots)."""
     today_sql = text("""
         SELECT
             DATE_TRUNC('hour', scanned_at AT TIME ZONE 'UTC') AS hour_utc,
@@ -244,17 +255,14 @@ async def get_analytics():
     async with get_db_session() as db:
         rows = (await db.execute(today_sql)).mappings().all()
 
-    # Tạo 8 slot x 3h (00:00, 03:00, ..., 21:00)
     slots = [
         {"time": f"{str(i * 3).zfill(2)}:00", "visits": 0, "conversions": 0}
         for i in range(8)
     ]
-
     for row in rows:
         if not row["hour_utc"]:
             continue
-        hour = row["hour_utc"].hour
-        slot_idx = hour // 3
+        slot_idx = row["hour_utc"].hour // 3
         if 0 <= slot_idx < 8:
             slots[slot_idx]["visits"] += int(row["total"] or 0)
             slots[slot_idx]["conversions"] += int(row["matched"] or 0)
@@ -263,25 +271,31 @@ async def get_analytics():
 
 
 # =============================================================================
-# WEBHOOK — nhận event từ camera Hikvision
+# WEBHOOK – receive events from Hikvision cameras
 # =============================================================================
 
 
 @router.post("/api/v1/cameras/events/{secret_key}", status_code=HTTP_200_OK)
 async def receive_camera_event(
     request: Request,
-    secret_key: str = Path(..., description="Chuỗi key xác thực Webhook"),
+    secret_key: str = Path(..., description="Webhook auth key"),
     payload: bytes = Body(..., media_type="application/octet-stream"),
 ):
-    """Nhận webhook ISAPI từ camera Hikvision."""
+    """Receive ISAPI webhook payload from a Hikvision camera."""
+    raw_ip = request.client.host if request.client else "unknown"
+
     if secret_key != settings.hik_webhook_secret:
-        logger.warning(f"CHẶN TRUY CẬP: Secret key không hợp lệ ({secret_key})")
+        logger.warning("Blocked invalid secret key: %s", secret_key)
         raise HTTPException(
             status_code=HTTP_401_UNAUTHORIZED, detail="Invalid secret key"
         )
 
-    raw_ip = request.client.host if request.client else "unknown"
-    logger.info(f"Nhận webhook hợp lệ từ IP: {raw_ip}")
+    allowed_ips = settings.allowed_camera_ips_list
+    if allowed_ips and raw_ip not in allowed_ips:
+        logger.warning("Blocked camera webhook from unauthorized IP: %s", raw_ip)
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN, detail="Camera IP is not allowed"
+        )
 
     try:
         body = await request.body()
@@ -295,25 +309,22 @@ async def receive_camera_event(
             "utf-8", errors="ignore"
         )
 
-        mac_match = re.search(r"<macAddress>(.*?)</macAddress>", xml_data)
-        ip_match = re.search(r"<ipAddress>(.*?)</ipAddress>", xml_data)
-        event_match = re.search(r"<eventType>(.*?)</eventType>", xml_data)
-        time_match = re.search(r"<dateTime>(.*?)</dateTime>", xml_data)
+        def _re(pattern: str) -> str:
+            m = re.search(pattern, xml_data)
+            return m.group(1) if m else ""
 
         camera_id = (
-            mac_match.group(1).replace(":", "").upper()
-            if mac_match
-            else (ip_match.group(1) if ip_match else raw_ip)
+            _re(r"<macAddress>(.*?)</macAddress>")
+            or _re(r"<ipAddress>(.*?)</ipAddress>")
+            or raw_ip
         )
-        event_type = event_match.group(1).lower() if event_match else "unknown"
-        occurred_at_iso = (
-            time_match.group(1)
-            if time_match
-            else datetime.now(timezone.utc).isoformat()
+        event_type = _re(r"<eventType>(.*?)</eventType>").lower() or "unknown"
+        occurred_at = (
+            _re(r"<dateTime>(.*?)</dateTime>") or datetime.now(timezone.utc).isoformat()
         )
 
-        if event_type in ["duration", "videoloss"]:
-            return {"status": "ok", "message": f"Ignored {event_type} event"}
+        if event_type in ("duration", "videoloss"):
+            return {"status": "ok", "message": f"Ignored {event_type}"}
 
         jpg_start = body.find(b"\xff\xd8")
         jpg_end = body.rfind(b"\xff\xd9")
@@ -322,53 +333,79 @@ async def receive_camera_event(
 
         image_data = body[jpg_start : jpg_end + 2]
         image_size_kb = len(image_data) / 1024
-
         filename = f"{camera_id}_{event_type}_{uuid.uuid4().hex[:8]}.jpg"
         filepath = os.path.join(settings.raw_snapshot_dir, filename)
-        with open(filepath, "wb") as f:
-            f.write(image_data)
+
+        # TOI UU: Lưu file không chặn event loop
+        async with aiofiles.open(filepath, "wb") as f:
+            await f.write(image_data)
 
         logger.info(
-            f"📥 [WEBHOOK] Camera: {camera_id} | Event: {event_type} | "
-            f"Payload: {image_size_kb:.1f} KB | Time: {occurred_at_iso}"
+            "📥 [WEBHOOK] camera=%s event=%s size=%.1f KB time=%s",
+            camera_id,
+            event_type,
+            image_size_kb,
+            occurred_at,
         )
 
         process_camera_event.delay(
             camera_id=camera_id,
             snapshot_filename=filename,
-            occurred_at_iso=occurred_at_iso,
+            occurred_at_iso=occurred_at,
             event_type=event_type,
         )
 
-        logger.info(f"[{camera_id}] Received '{event_type}', saved {filename}, queued.")
-        return {"status": "ok", "message": "Event queued for processing"}
+        return {"status": "ok", "message": "Event queued"}
 
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("Webhook processing error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal processing error")
 
 
 # =============================================================================
-# WEBSOCKET — push real-time events xuống Next.js
+# WEBSOCKET – push real-time events to Next.js
 # =============================================================================
-
-
 @router.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket):
-    """
-    WebSocket endpoint — Next.js kết nối vào đây để nhận real-time events.
-    Mỗi khi có face_match / unknown_face, backend publish lên Redis,
-    EventSubscriber relay xuống WebSocket này, Next.js cập nhật UI ngay.
-    """
     await websocket.accept()
-    logger.info("New WebSocket connection accepted.")
-    try:
-        async with EventSubscriber() as subscriber:
+    logger.info("WebSocket client connected.")
+
+    async with EventSubscriber() as subscriber:
+        # Task 1: Nghe tin nhắn từ Redis và gửi xuống Client
+        async def send_events():
             async for event in subscriber:
                 await websocket.send_json(event)
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected.")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        if websocket.client_state.name != "DISCONNECTED":
-            await websocket.close()
+
+        # Task 2: Chờ tín hiệu client ngắt kết nối (ĐÃ SỬA LỖI RUNTIMERROR)
+        async def listen_disconnect():
+            try:
+                while True:
+                    # Đọc message thô để kiểm tra loại message
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        logger.debug("Received disconnect message type from client.")
+                        break
+            except WebSocketDisconnect:
+                logger.debug("WebSocketDisconnect exception caught inside listener.")
+            except RuntimeError as e:
+                # Bắt lỗi "Cannot call receive once a disconnect message..." nếu có
+                if "disconnect" in str(e):
+                    logger.debug(
+                        "RuntimeError caught safely: Client already disconnected."
+                    )
+                else:
+                    raise e
+
+        # Chạy song song cả 2 tác vụ
+        task_send = asyncio.create_task(send_events())
+        task_listen = asyncio.create_task(listen_disconnect())
+
+        done, pending = await asyncio.wait(
+            [task_send, task_listen], return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Hủy tác vụ còn lại để giải phóng tài nguyên hệ thống
+        for task in pending:
+            task.cancel()
+
+    logger.info("WebSocket client disconnected & cleaned up.")

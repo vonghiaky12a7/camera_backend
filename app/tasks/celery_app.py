@@ -17,13 +17,10 @@
 # =============================================================================
 
 from __future__ import annotations
-
 import logging
 import os
-
 from celery import Celery
 from celery.signals import worker_process_init, worker_process_shutdown
-
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -50,7 +47,8 @@ celery_app = Celery(
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
     include=[
-        "app.tasks.process_event",  # Auto-discover task modules
+        "app.tasks.process_event",
+        "app.tasks.cleanup",
     ],
 )
 
@@ -98,6 +96,17 @@ celery_app.conf.update(
     # ── Logging ───────────────────────────────────────────────────────────────
     worker_hijack_root_logger=False,  # Let our structlog config manage logging
     worker_log_color=False,
+    beat_schedule={
+        "cleanup-snapshots-every-5-minutes": {
+            "task": "app.tasks.cleanup.cleanup_old_snapshots",
+            "schedule": 300.0,
+        },
+        # 👉 TASK 10: CHỐT SỔ THỐNG KÊ DASHBOARD MỖI 10 GIÂY
+        "update-dashboard-stats-every-10s": {
+            "task": "app.tasks.celery_app.periodic_dashboard_sync",
+            "schedule": 10.0,
+        },
+    },
 )
 
 
@@ -135,3 +144,18 @@ def shutdown_worker_process(**kwargs: object) -> None:
     from app.services.face import FaceAnalyzer  # noqa: PLC0415
 
     FaceAnalyzer.teardown()
+
+
+@celery_app.task(name="app.tasks.celery_app.periodic_dashboard_sync")
+def periodic_dashboard_sync():
+    """Chạy ngầm định kỳ để cập nhật tổng số lượng khách hàng thay vì gọi mỗi khi Webhook kích hoạt"""
+    import asyncio
+    from app.services.stats_service import update_dashboard_stats
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    loop.run_until_complete(update_dashboard_stats())

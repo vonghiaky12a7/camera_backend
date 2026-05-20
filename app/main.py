@@ -6,7 +6,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +16,8 @@ from app.core.database import connect_db, disconnect_db
 from app.core.redis import connect_redis, disconnect_redis
 from fastapi.responses import RedirectResponse
 from logging.handlers import RotatingFileHandler
+from fastapi import WebSocket, WebSocketDisconnect
+import os
 
 # Cấu hình logging ghi ra cả Console (màn hình) và File (app.log)
 log_formatter = logging.Formatter(
@@ -71,7 +73,6 @@ app.add_middleware(
 
 # ── Mount Static Files ────────────────────────────────────────────────────────
 # Phục vụ thư mục chứa ảnh snapshot tạm thời để UI Next.js có thể hiển thị
-import os
 
 os.makedirs(settings.raw_snapshot_dir, exist_ok=True)
 app.mount("/snapshots", StaticFiles(directory=settings.raw_snapshot_dir), name="snapshots")

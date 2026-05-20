@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
 
 from app.core.config import settings
 
@@ -46,19 +46,19 @@ class Base(DeclarativeBase):
 # Engine
 # ---------------------------------------------------------------------------
 def _build_engine() -> AsyncEngine:
-    """
-    Builds the SQLAlchemy AsyncEngine from settings.
-    """
-    # Chuyển đổi Pydantic URL object thành chuỗi string chuẩn
-    # SQLAlchemy sẽ tự động bóc tách host, port, user, password từ chuỗi này
     db_url_str = str(settings.odoo_database_url)
 
+    # Nếu đang chạy bằng Celery Worker thì không dùng Pool để tránh cạn kiệt Connection
+    if settings.service_role in ("worker", "beat"):
+        return create_async_engine(db_url_str, echo=False, poolclass=NullPool)
+
+    # Dành cho FastAPI (API Role)
     return create_async_engine(
         db_url_str,
         echo=False,
+        poolclass=AsyncAdaptedQueuePool,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
-        # Đã xóa phần connect_args gây lỗi phiên bản
     )
 
 

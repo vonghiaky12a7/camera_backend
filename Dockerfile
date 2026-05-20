@@ -19,10 +19,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# FIX VULNERABILITIES: Chạy upgrade để vá các lỗ hổng bảo mật từ image gốc
+# FIX VULNERABILITIES & TỐI ƯU HÓA: Đã bỏ libgl1, libglib2.0-0
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
     libgomp1 \
     libpq5 \
     curl \
