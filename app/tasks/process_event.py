@@ -334,9 +334,9 @@ async def _handle_match(
     if direction == "out":
         await db.execute(
             text(
-                """UPDATE res_partner SET current_floor_id = NULL, current_zone_id = NULL, last_seen_time = :now, last_seen_camera_id = :cam_id WHERE id = :pid"""
+                """UPDATE res_partner SET current_floor_id = NULL, current_zone_id = NULL, last_seen_time = NULL, last_seen_camera_id = NULL WHERE id = :pid"""
             ),
-            {"now": occurred_at, "cam_id": cam_int_id, "pid": partner.id},
+            {"pid": partner.id},
         )
     else:
         await db.execute(
@@ -391,6 +391,7 @@ async def _save_scan_history(db, camera_info, occurred_at, faces_data, full_imag
     floor_name = camera_info.get("floor_name", "")
     zone_id = camera_info.get("zone_id")
     zone_name = camera_info.get("zone_name", "")
+    direction = camera_info.get("direction", "internal")
 
     history = CameraScanHistory(
         camera_id=cam_int_id,
@@ -412,6 +413,7 @@ async def _save_scan_history(db, camera_info, occurred_at, faces_data, full_imag
             camera_id=cam_int_id,
             floor_id=floor_id,
             zone_id=zone_id,
+            direction=direction,
             scanned_at=occurred_at,
             partner_id=face.get("partner_id"),
             user_id=face.get("user_id"),
@@ -447,6 +449,7 @@ async def _save_scan_history(db, camera_info, occurred_at, faces_data, full_imag
                     "confidence": face.get("confidence", 0.0),
                     "user_id": face.get("user_id"),
                     "is_employee": face.get("is_employee", False),
+                    "direction": direction,
                     "is_matched": face.get("is_matched", False),
                     "face_image_url": (
                         f"data:image/jpeg;base64,{face['face_base64']}"
@@ -842,6 +845,7 @@ def process_camera_event(
     except Exception as exc:
         logger.error("[%s] Task failed: %s", camera_id, exc, exc_info=True)
         raise self.retry(exc=exc, countdown=5)
+
 
 
 

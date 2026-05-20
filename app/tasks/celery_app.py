@@ -101,6 +101,10 @@ celery_app.conf.update(
             "task": "app.tasks.cleanup.cleanup_old_snapshots",
             "schedule": 300.0,
         },
+        "clear-stale-camera-customers-every-5-minutes": {
+            "task": "app.tasks.cleanup.clear_stale_camera_customers",
+            "schedule": 300.0,
+        },
         # 👉 TASK 10: CHỐT SỔ THỐNG KÊ DASHBOARD MỖI 10 GIÂY
         "update-dashboard-stats-every-10s": {
             "task": "app.tasks.celery_app.periodic_dashboard_sync",

@@ -33,6 +33,7 @@ class CameraScanHistoryResult(Base):
     partner_id = Column(Integer, nullable=True)
     user_id = Column(Integer, nullable=True)
     is_employee = Column(Boolean, default=False, index=True)
+    direction = Column(String, default="internal", index=True)
     confidence = Column(Float)
     camera_id = Column(Integer, nullable=True)
 
@@ -43,4 +44,5 @@ class CameraScanHistoryResult(Base):
 
     face_image = Column(LargeBinary)
     embedding = Column(Text, nullable=True)
+
 
